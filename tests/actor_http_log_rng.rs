@@ -176,3 +176,26 @@ async fn actor_http_log_rng_component() -> anyhow::Result<()> {
         .expect("`HttpServer.HandleRequest` must not fail");
     assert_response(response)
 }
+
+#[tokio::test]
+async fn actor_kv_demo() -> anyhow::Result<()> {
+    _ = Lazy::force(&LOGGER);
+
+    let (wasm, key) = sign(include_bytes!("../kv_demo.fused.wasm")).context("failed to sign component")?;
+
+    let rt = new_runtime();
+    let actor = ActorComponent::new(&rt, wasm).expect("failed to read actor component");
+    assert_eq!(actor.claims().subject, key.public_key());
+
+    let mut actor = actor
+        .instantiate()
+        .await
+        .expect("failed to instantiate actor component");
+
+    let response = actor
+        .call("HttpServer.HandleRequest", Some(REQUEST.as_slice()))
+        .await
+        .context("failed to call `HttpServer.HandleRequest`")?
+        .expect("`HttpServer.HandleRequest` must not fail");
+    assert_response(response)
+}
