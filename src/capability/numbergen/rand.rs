@@ -24,7 +24,7 @@ impl<T> Numbergen<T> {
     }
 }
 
-impl<T: Rng + CryptoRng> super::Numbergen for Numbergen<T> {
+impl<T: Rng + CryptoRng + Sync + Send> super::Numbergen for Numbergen<T> {
     type Error = &'static str;
 
     fn generate_guid(&self, _: &jwt::Claims<jwt::Actor>) -> Result<Uuid, Self::Error> {

@@ -16,7 +16,7 @@ use wasmcloud_interface_logging::LogEntry;
 use wasmcloud_interface_numbergen::RangeLimit;
 
 /// Capability handler
-pub trait Handler {
+pub trait Handler: Sync + Send {
     /// Error returned by [`Handler::handle`] operations
     type Error: ToString + Debug;
 
@@ -71,12 +71,14 @@ where
     T: Into<Vec<u8>>,
     E: ToString + Debug,
     F: Fn(
-        &jwt::Claims<jwt::Actor>,
-        String,
-        String,
-        String,
-        Option<Vec<u8>>,
-    ) -> anyhow::Result<Result<Option<T>, E>>,
+            &jwt::Claims<jwt::Actor>,
+            String,
+            String,
+            String,
+            Option<Vec<u8>>,
+        ) -> anyhow::Result<Result<Option<T>, E>>
+        + Sync
+        + Send,
 {
     type Error = E;
 

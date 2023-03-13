@@ -13,7 +13,7 @@ use core::fmt::Debug;
 use wascap::jwt;
 
 /// Builtin logging capability available within `wasmcloud:builtin:logging` namespace
-pub trait Logging {
+pub trait Logging: Sync + Send {
     /// Error returned by logging operations
     type Error: ToString + Debug;
 

@@ -2,7 +2,6 @@ use std::str::FromStr;
 
 use anyhow::{bail, ensure, Context};
 use once_cell::sync::Lazy;
-use rand::thread_rng;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::fs;
@@ -45,7 +44,7 @@ static REQUEST: Lazy<Vec<u8>> = Lazy::new(|| {
 fn new_runtime() -> Runtime<impl capability::Handler> {
     Runtime::builder(BuiltinHandler {
         logging: LogLogging::from(log::logger()),
-        numbergen: RandNumbergen::from(thread_rng()),
+        numbergen: RandNumbergen::from(rand::rngs::OsRng),
         external: |claims: &jwt::Claims<jwt::Actor>,
                    bd,
                    ns,
@@ -152,6 +151,11 @@ async fn actor_http_log_rng_component() -> anyhow::Result<()> {
         .validate(true)
         .module(&wasm)
         .context("failed to encode binary")?
+        .adapter(
+            "wasi_snapshot_preview1",
+            include_bytes!("adapters/wasi_snapshot_preview1.reactor.wasm"),
+        )
+        .context("failed to add WASI adapter")?
         .encode()
         .context("failed to encode a component")?;
     let (wasm, key) = sign(wasm).context("failed to sign component")?;
@@ -162,10 +166,12 @@ async fn actor_http_log_rng_component() -> anyhow::Result<()> {
 
     let mut actor = actor
         .instantiate()
+        .await
         .expect("failed to instantiate actor component");
 
     let response = actor
         .call("HttpServer.HandleRequest", Some(REQUEST.as_slice()))
+        .await
         .context("failed to call `HttpServer.HandleRequest`")?
         .expect("`HttpServer.HandleRequest` must not fail");
     assert_response(response)

@@ -13,7 +13,7 @@ use core::fmt::Debug;
 use wascap::jwt;
 
 /// Builtin random number generation capability available within `wasmcloud:builtin:numbergen` namespace
-pub trait Numbergen {
+pub trait Numbergen: Sync + Send {
     /// Error returned by random number generation operations
     type Error: ToString + Debug;
 

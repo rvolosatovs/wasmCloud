@@ -1,5 +1,8 @@
 #![cfg(target_arch = "wasm32")]
 
+use wasmbus_rpc::common::{deserialize, serialize};
+use wasmcloud_interface_httpserver::{HttpRequest, HttpResponse};
+
 wit_bindgen::generate!({
     world: "wasmcloud",
     path: "../../../wit",

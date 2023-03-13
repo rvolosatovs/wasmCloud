@@ -5,7 +5,6 @@
 use std::env::args;
 
 use anyhow::{self, bail, ensure, Context};
-use rand::thread_rng;
 use tokio::fs;
 use tokio::io::{stdin, AsyncReadExt};
 use tracing_subscriber::prelude::*;
@@ -30,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
 
     let rt: Runtime<_> = Runtime::builder(BuiltinHandler {
         logging: LogLogging::from(log::logger()),
-        numbergen: RandNumbergen::from(thread_rng()),
+        numbergen: RandNumbergen::from(rand::rngs::OsRng),
         external: |claims: &jwt::Claims<jwt::Actor>,
                    bd,
                    ns,

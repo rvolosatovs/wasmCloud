@@ -20,6 +20,7 @@ impl<H> RuntimeBuilder<H> {
     #[must_use]
     pub fn new(handler: impl Into<Arc<H>>) -> Self {
         let mut engine_config = wasmtime::Config::default();
+        engine_config.async_support(true);
         #[cfg(feature = "component-model")]
         engine_config.wasm_component_model(true);
         Self {

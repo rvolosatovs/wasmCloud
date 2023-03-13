@@ -7,13 +7,18 @@ use core::fmt::{self, Debug};
 use std::sync::Arc;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use futures::AsyncReadExt;
 use tracing::{instrument, warn};
 use wascap::jwt;
 
-wasmtime::component::bindgen!("wasmcloud");
+wasmtime::component::bindgen!({
+    world: "wasmcloud",
+    async: true,
+});
 
 pub(super) struct Ctx<'a, H> {
+    pub wasi: ::host::WasiCtx,
     pub claims: &'a jwt::Claims<jwt::Actor>,
     pub handler: Arc<H>,
 }
@@ -29,12 +34,19 @@ impl<H> Debug for Ctx<'_, H> {
 
 impl<'a, H> Ctx<'a, H> {
     fn new(claims: &'a jwt::Claims<jwt::Actor>, handler: Arc<H>) -> anyhow::Result<Self> {
-        Ok(Self { claims, handler })
+        // TODO: Set stdio pipes
+        let wasi = wasi_cap_std_sync::WasiCtxBuilder::new().build();
+        Ok(Self {
+            wasi,
+            claims,
+            handler,
+        })
     }
 }
 
+#[async_trait]
 impl<H: capability::Handler> host::Host for Ctx<'_, H> {
-    fn host_call(
+    async fn host_call(
         &mut self,
         binding: String,
         namespace: String,
@@ -118,20 +130,24 @@ impl<H: capability::Handler + 'static> Component<H> {
 
     /// Instantiates a [Component] and returns the resulting [Instance].
     #[instrument(skip_all)]
-    pub fn instantiate(&self) -> anyhow::Result<Instance<H>>
+    pub async fn instantiate(&self) -> anyhow::Result<Instance<H>>
     where
-        H: capability::Handler + 'static,
+        H: capability::Handler + Sync + Send + 'static,
     {
         let mut linker = wasmtime::component::Linker::new(&self.engine);
 
         Wasmcloud::add_to_linker(&mut linker, |ctx: &mut Ctx<'_, H>| ctx)
             .context("failed to link `Wasmcloud` interface")?;
 
+        ::host::add_to_linker(&mut linker, |ctx: &mut Ctx<'_, H>| &mut ctx.wasi)
+            .context("failed to link `WASI` interface")?;
+
         let cx = Ctx::new(&self.claims, Arc::clone(&self.handler))
             .context("failed to construct store context")?;
         let mut store = wasmtime::Store::new(&self.engine, cx);
 
-        let (bindings, _) = Wasmcloud::instantiate(&mut store, &self.component, &linker)
+        let (bindings, _) = Wasmcloud::instantiate_async(&mut store, &self.component, &linker)
+            .await
             .context("failed to instantiate component")?;
         Ok(Instance { bindings, store })
     }
@@ -143,10 +159,10 @@ pub struct Instance<'a, H> {
     store: wasmtime::Store<Ctx<'a, H>>,
 }
 
-impl<H> Instance<'_, H> {
+impl<H: Sync + Send> Instance<'_, H> {
     /// Invoke an operation on an [Instance] producing a [Response].
     #[instrument(skip_all)]
-    pub fn call(
+    pub async fn call(
         &mut self,
         operation: impl AsRef<str>,
         payload: Option<impl AsRef<[u8]>>,
@@ -158,6 +174,7 @@ impl<H> Instance<'_, H> {
                 operation.as_ref(),
                 payload.as_ref().map(AsRef::as_ref),
             )
+            .await
             .context("failed to call `guest-call`")
     }
 }
