@@ -1,15 +1,32 @@
-use super::{guest_call, wasm};
-
 use crate::capability;
 
 use core::fmt::{self, Debug};
+use core::ptr::NonNull;
 
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use tracing::{instrument, trace, trace_span, warn};
 use wascap::jwt;
+
+pub mod guest_call {
+    use super::{wasm, NonNull};
+
+    pub type Params = (wasm::usize, wasm::usize);
+    pub type Result = wasm::usize;
+
+    pub type State = (NonNull<[u8]>, NonNull<[u8]>);
+}
+
+mod wasm {
+    #[allow(non_camel_case_types)]
+    pub type ptr = u32;
+    #[allow(non_camel_case_types)]
+    pub type usize = u32;
+
+    pub const ERROR: usize = usize::MAX;
+    pub const SUCCESS: usize = 1;
+}
 
 pub struct Ctx<H> {
     console_log: Vec<String>,
@@ -235,6 +252,7 @@ fn host_call<H: capability::Handler>(
     let op = read_string(&mut store, &memory, op_ptr, op_len)
         .context("failed to read `__host_call` operation")?;
 
+    // TODO: make payload nullable
     let pld = read_bytes(&mut store, &memory, pld_ptr, pld_len)
         .context("failed to read `__host_call` payload")?;
 
@@ -253,12 +271,14 @@ fn host_call<H: capability::Handler>(
     match trace_span!("capability::Handler::handle", bd, ns, op, ?pld)
         .in_scope(|| {
             let ctx = store.data();
-            ctx.wasmbus.handler.handle(ctx.claims, bd, ns, op, pld)
+            ctx.wasmbus
+                .handler
+                .handle(ctx.claims, bd, ns, op, Some(pld))
         })
         .context("failed to handle provider invocation")?
     {
         Ok(buf) => {
-            set_host_response(&mut store, buf);
+            set_host_response(&mut store, buf.unwrap_or_default());
             Ok(wasm::SUCCESS)
         }
         Err(err) => {

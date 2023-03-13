@@ -7,11 +7,11 @@ use wasmbus_rpc::wascap::prelude::{ClaimsBuilder, KeyPair};
 use wasmbus_rpc::wascap::wasm::embed_claims;
 use wasmbus_rpc::wascap::{caps, jwt};
 use wasmcloud::capability::{BuiltinHandler, LogLogging, RandNumbergen};
-use wasmcloud::{ActorModule, ActorResponse, Runtime};
+use wasmcloud::{ActorModule, ActorModuleResponse, Runtime};
 use wasmcloud_interface_httpserver::{HttpRequest, HttpResponse};
 
 fn main() -> anyhow::Result<()> {
-    const WASM: &str = env!("CARGO_CDYLIB_FILE_ACTOR_ECHO");
+    const WASM: &str = env!("CARGO_CDYLIB_FILE_ACTOR_ECHO_MODULE");
     let wasm = fs::read(WASM).context("failed to read `{WASM}`")?;
 
     let issuer = KeyPair::new_account();
@@ -32,11 +32,12 @@ fn main() -> anyhow::Result<()> {
         numbergen: RandNumbergen::from(thread_rng()),
         external: (),
     })
-    .into();
+    .try_into()
+    .context("failed to construct runtime")?;
     let actor = ActorModule::read(&rt, wasm.as_slice()).context("failed to read actor module")?;
     let mut actor = actor.instantiate().context("failed to instantiate actor")?;
     let buf = serialize(&HttpRequest::default()).context("failed to encode request")?;
-    let ActorResponse {
+    let ActorModuleResponse {
         code,
         response,
         console_log,

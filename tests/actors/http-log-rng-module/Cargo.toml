@@ -1,5 +1,5 @@
 [package]
-name = "actor-http-log-rng"
+name = "actor-http-log-rng-module"
 version = "0.1.0"
 edition = "2021"
 

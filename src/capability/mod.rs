@@ -34,8 +34,8 @@ pub trait Handler {
         binding: String,
         namespace: String,
         operation: String,
-        payload: Vec<u8>,
-    ) -> anyhow::Result<Result<Vec<u8>, Self::Error>>;
+        payload: Option<Vec<u8>>,
+    ) -> anyhow::Result<Result<Option<Vec<u8>>, Self::Error>>;
 }
 
 /// A [Handler], which handles all builtin capability invocations using [Logging], [Numbergen] and
@@ -60,8 +60,8 @@ impl Handler for () {
         _: String,
         _: String,
         _: String,
-        _: Vec<u8>,
-    ) -> anyhow::Result<Result<Vec<u8>, Self::Error>> {
+        _: Option<Vec<u8>>,
+    ) -> anyhow::Result<Result<Option<Vec<u8>>, Self::Error>> {
         Ok(Err("not supported"))
     }
 }
@@ -75,8 +75,8 @@ where
         String,
         String,
         String,
-        Vec<u8>,
-    ) -> anyhow::Result<Result<T, E>>,
+        Option<Vec<u8>>,
+    ) -> anyhow::Result<Result<Option<T>, E>>,
 {
     type Error = E;
 
@@ -86,10 +86,11 @@ where
         binding: String,
         namespace: String,
         operation: String,
-        payload: Vec<u8>,
-    ) -> anyhow::Result<Result<Vec<u8>, Self::Error>> {
+        payload: Option<Vec<u8>>,
+    ) -> anyhow::Result<Result<Option<Vec<u8>>, Self::Error>> {
         match self(claims, binding, namespace, operation, payload) {
-            Ok(Ok(res)) => Ok(Ok(res.into())),
+            Ok(Ok(Some(res))) => Ok(Ok(Some(res.into()))),
+            Ok(Ok(None)) => Ok(Ok(None)),
             Ok(Err(err)) => Ok(Err(err)),
             Err(err) => Err(err),
         }
@@ -111,10 +112,11 @@ where
         binding: String,
         namespace: String,
         operation: String,
-        payload: Vec<u8>,
-    ) -> anyhow::Result<Result<Vec<u8>, Self::Error>> {
+        payload: Option<Vec<u8>>,
+    ) -> anyhow::Result<Result<Option<Vec<u8>>, Self::Error>> {
         match (binding.as_str(), namespace.as_str(), operation.as_str()) {
             (_, "wasmcloud:builtin:logging", "Logging.WriteLog") => {
+                let payload = payload.context("payload cannot be empty")?;
                 let LogEntry { level, text } =
                     deserialize(&payload).context("failed to deserialize log entry")?;
                 let res =
@@ -132,7 +134,7 @@ where
                         }
                     };
                 match res {
-                    Ok(()) => Ok(Ok(vec![])),
+                    Ok(()) => Ok(Ok(None)),
                     Err(err) => Ok(Err(err.to_string())),
                 }
             }
@@ -142,17 +144,20 @@ where
                 {
                     Ok(guid) => serialize(&guid.to_string())
                         .context("failed to serialize UUID")
-                        .map(Ok),
+                        .map(|guid| Ok(Some(guid))),
                     Err(err) => Ok(Err(err.to_string())),
                 }
             }
             (_, "wasmcloud:builtin:numbergen", "NumberGen.RandomInRange") => {
+                let payload = payload.context("payload cannot be empty")?;
                 let RangeLimit { min, max } =
                     deserialize(&payload).context("failed to deserialize range limit")?;
                 match trace_span!("Numbergen::random_in_range")
                     .in_scope(|| self.numbergen.random_in_range(claims, min, max))
                 {
-                    Ok(v) => serialize(&v).context("failed to serialize number").map(Ok),
+                    Ok(v) => serialize(&v)
+                        .context("failed to serialize number")
+                        .map(|v| Ok(Some(v))),
                     Err(err) => Ok(Err(err.to_string())),
                 }
             }
@@ -160,7 +165,9 @@ where
                 match trace_span!("Numbergen::random_32")
                     .in_scope(|| self.numbergen.random_32(claims))
                 {
-                    Ok(v) => serialize(&v).context("failed to serialize number").map(Ok),
+                    Ok(v) => serialize(&v)
+                        .context("failed to serialize number")
+                        .map(|v| Ok(Some(v))),
                     Err(err) => Ok(Err(err.to_string())),
                 }
             }

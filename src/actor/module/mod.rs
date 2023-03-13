@@ -1,7 +1,10 @@
-use super::guest_call;
-use super::{actor_claims, wasmbus, Ctx, Response};
+mod wasmbus;
 
-use crate::{capability, InstanceConfig, Runtime};
+use self::wasmbus::guest_call;
+
+use super::actor_claims;
+
+use crate::{capability, Runtime};
 
 use core::fmt::{self, Debug};
 
@@ -12,12 +15,70 @@ use futures::AsyncReadExt;
 use tracing::{instrument, warn};
 use wascap::jwt;
 
+/// Actor module instance configuration
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    /// Minimum amount of WebAssembly memory pages to allocate for WebAssembly module instance.
+    ///
+    /// A WebAssembly memory page size is 64k.
+    pub min_memory_pages: u32,
+    /// WebAssembly memory page allocation limit for a WebAssembly module instance.
+    ///
+    /// A WebAssembly memory page size is 64k.
+    pub max_memory_pages: Option<u32>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            min_memory_pages: 4,
+            max_memory_pages: None,
+        }
+    }
+}
+
+pub(super) struct Ctx<'a, H> {
+    pub wasi: wasmtime_wasi::WasiCtx,
+    pub claims: &'a jwt::Claims<jwt::Actor>,
+    pub wasmbus: wasmbus::Ctx<H>,
+}
+
+impl<H> Debug for Ctx<'_, H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ctx")
+            .field("runtime", &"wasmtime")
+            .field("wasmbus", &self.wasmbus)
+            .field("claims", &self.claims)
+            .finish()
+    }
+}
+
+impl<'a, H> Ctx<'a, H> {
+    fn new(claims: &'a jwt::Claims<jwt::Actor>, handler: Arc<H>) -> Result<Self> {
+        // TODO: Set stdio pipes
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+            .arg("main.wasm")
+            .context("failed to set argv[0]")?
+            .build();
+        let wasmbus = wasmbus::Ctx::new(handler);
+        Ok(Self {
+            wasi,
+            wasmbus,
+            claims,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.wasmbus.reset();
+    }
+}
+
 /// Pre-compiled actor [Module], which is cheapily-[Cloneable](Clone)
 pub struct Module<H> {
     module: wasmtime::Module,
     claims: jwt::Claims<jwt::Actor>,
     handler: Arc<H>,
-    instance_config: InstanceConfig,
+    config: Config,
 }
 
 impl<H> Clone for Module<H> {
@@ -26,7 +87,7 @@ impl<H> Clone for Module<H> {
             module: self.module.clone(),
             claims: self.claims.clone(),
             handler: Arc::clone(&self.handler),
-            instance_config: self.instance_config,
+            config: self.config,
         }
     }
 }
@@ -36,6 +97,7 @@ impl<H> Debug for Module<H> {
         f.debug_struct("Module")
             .field("runtime", &"wasmtime")
             .field("claims", &self.claims)
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -59,7 +121,7 @@ impl<H: capability::Handler + 'static> Module<H> {
             module,
             claims,
             handler: Arc::clone(&rt.handler),
-            instance_config: rt.instance_config,
+            config: rt.module_config,
         })
     }
 
@@ -100,10 +162,7 @@ impl<H: capability::Handler + 'static> Module<H> {
 
         let memory = wasmtime::Memory::new(
             &mut store,
-            wasmtime::MemoryType::new(
-                self.instance_config.min_memory_pages,
-                self.instance_config.max_memory_pages,
-            ),
+            wasmtime::MemoryType::new(self.config.min_memory_pages, self.config.max_memory_pages),
         )
         .context("failed to initialize memory")?;
         linker
@@ -121,6 +180,18 @@ impl<H: capability::Handler + 'static> Module<H> {
             .context("failed to get `__guest_call` export")?;
         Ok(Instance { func, store })
     }
+}
+
+/// An actor module [`Instance`] operation result returned in response to [`Instance::call`]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Response {
+    /// Code returned by an invocation of an operation on an actor [Instance].
+    pub code: u32,
+    /// Binary guest operation invocation response if returned by the guest.
+    pub response: Option<Vec<u8>>,
+    /// Console logs produced by a [Instance] operation invocation. Note, that this functionality
+    /// is deprecated and should be empty in most cases.
+    pub console_log: Vec<String>,
 }
 
 /// An instance of a [Module]
@@ -180,7 +251,6 @@ mod tests {
     use super::*;
 
     use crate::capability::{self, BuiltinHandler, Uuid};
-    use crate::{ActorModule, ActorResponse, Runtime};
 
     use std::convert::Infallible;
 
@@ -201,7 +271,7 @@ mod tests {
             .with(
                 tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(
-                        "info,integration=trace,wasmcloud=trace,cranelift_codegen=warn",
+                        "info,wasmcloud=trace,cranelift_codegen=warn",
                     )
                 }),
             )
@@ -278,7 +348,7 @@ mod tests {
         .expect("failed to serialize request")
     });
     static HTTP_LOG_RNG_MODULE: Lazy<Module<TestHandler>> = Lazy::new(|| {
-        let wasm = std::fs::read(env!("CARGO_CDYLIB_FILE_ACTOR_HTTP_LOG_RNG"))
+        let wasm = std::fs::read(env!("CARGO_CDYLIB_FILE_ACTOR_HTTP_LOG_RNG_MODULE"))
             .expect("failed to read `{HTTP_LOG_RNG_WASM}`");
 
         let issuer = KeyPair::new_account();
@@ -291,8 +361,7 @@ mod tests {
             .build();
         let wasm = embed_claims(&wasm, &claims, &issuer).expect("failed to embed actor claims");
 
-        let actor =
-            ActorModule::read(&RUNTIME, wasm.as_slice()).expect("failed to read actor module");
+        let actor = Module::read(&RUNTIME, wasm.as_slice()).expect("failed to read actor module");
 
         assert_eq!(actor.claims().subject, module.public_key());
 
@@ -323,7 +392,7 @@ mod tests {
         actor.claims = claims;
         let mut actor = actor.instantiate().expect("failed to instantiate actor");
 
-        let ActorResponse {
+        let Response {
             code,
             console_log,
             response,
