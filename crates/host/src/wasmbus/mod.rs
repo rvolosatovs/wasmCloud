@@ -3,32 +3,48 @@ pub mod config;
 
 pub use config::Lattice as LatticeConfig;
 
+mod event;
+
+use crate::{fetch_actor, socket_pair};
+
 use core::future::Future;
+use core::num::NonZeroUsize;
+use core::ops::Deref;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map, BTreeMap, HashMap};
 use std::env;
 use std::env::consts::{ARCH, FAMILY, OS};
+use std::io::Cursor;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context as _};
-use bytes::Bytes;
+use anyhow::{anyhow, bail, ensure, Context as _};
+use bytes::{BufMut, Bytes, BytesMut};
 use cloudevents::{EventBuilder, EventBuilderV10};
-use futures::stream::{AbortHandle, Abortable};
-use futures::{try_join, Stream, StreamExt};
+use futures::channel::oneshot;
+use futures::lock::Mutex;
+use futures::stream::{self, AbortHandle, Abortable};
+use futures::{try_join, Stream, StreamExt, TryStreamExt};
 use nkeys::{KeyPair, KeyPairType};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::io::{stderr, AsyncWrite};
 use tokio::spawn;
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{debug, error, info, instrument, trace, warn};
 use ulid::Ulid;
 use uuid::Uuid;
+use wascap::jwt;
+use wasmcloud_runtime::{ActorInstancePool, Runtime};
+
+const SUCCESS: &str = r#"{"accepted":true,"error":""}"#;
 
 #[derive(Debug)]
 struct Queue {
@@ -89,6 +105,47 @@ impl Stream for Queue {
     }
 }
 
+#[derive(Clone, Default)]
+struct AsyncBytesMut(Arc<std::sync::Mutex<BytesMut>>);
+
+impl AsyncWrite for AsyncBytesMut {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Poll::Ready({
+            self.0
+                .lock()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+                .put_slice(buf);
+            Ok(buf.len())
+        })
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl TryFrom<AsyncBytesMut> for Vec<u8> {
+    type Error = anyhow::Error;
+
+    fn try_from(buf: AsyncBytesMut) -> Result<Self, Self::Error> {
+        buf.0
+            .lock()
+            .map(|buf| buf.clone().into())
+            .map_err(|e| anyhow!(e.to_string()).context("failed to lock"))
+    }
+}
+
 impl Queue {
     #[instrument]
     async fn new(
@@ -112,27 +169,157 @@ impl Queue {
             )),
         )
         .context("failed to subscribe to queues")?;
-        Ok(Self {
-            auction,
-            commands,
-            pings,
-            inventory,
-            links,
-            queries,
-            registries,
-        })
+        Ok(Self { auction, commands, pings, inventory, links, queries, registries })
     }
+}
+
+#[derive(Debug)]
+struct ActorInstance {
+    nats: async_nats::Client,
+    pool: ActorInstancePool,
+    id: Ulid,
+    calls: AbortHandle,
+}
+
+impl ActorInstance {
+    #[instrument(skip(payload))]
+    async fn handle_call(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
+        #[derive(Debug, Deserialize)]
+        struct Entity {
+            link_name: String,
+            contract_id: String,
+            public_key: String,
+        }
+        #[derive(Deserialize)]
+        struct Invocation {
+            origin: Entity,
+            target: Entity,
+            #[serde(default)]
+            operation: String,
+            #[serde(with = "serde_bytes")]
+            #[serde(default)]
+            msg: Vec<u8>,
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            encoded_claims: String,
+            #[serde(default)]
+            host_id: String,
+            #[serde(default)]
+            content_length: Option<u64>,
+            #[serde(rename = "traceContext")]
+            #[serde(default)]
+            trace_context: HashMap<String, String>,
+        }
+        #[derive(Default, Serialize)]
+        struct Response {
+            #[serde(with = "serde_bytes")]
+            #[serde(default)]
+            pub msg: Vec<u8>,
+            #[serde(default)]
+            pub invocation_id: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub error: Option<String>,
+            pub content_length: u64,
+        }
+        let Invocation {
+            origin,
+            target,
+            operation,
+            msg,
+            ..
+        } = rmp_serde::from_slice(payload.as_ref()).context("failed to decode invocation")?;
+
+        debug!(?origin, ?target, operation, "handle actor invocation");
+
+        let res = AsyncBytesMut::default();
+        let mut instance = self
+            .pool
+            .instantiate()
+            .await
+            .context("failed to instantiate actor")?;
+        instance
+            .stderr(stderr())
+            .await
+            .context("failed to set stderr")?
+            .call(operation, Cursor::new(msg), res.clone())
+            .await
+            .context("failed to call actor")
+            .map_err(|e| anyhow!(e))?;
+
+        let msg: Vec<u8> = res.try_into()?;
+        let content_length = msg.len().try_into().unwrap_or(u64::MAX);
+        rmp_serde::to_vec(&Response {
+            msg,
+            content_length,
+            ..Default::default()
+        })
+        .map(Into::into)
+        .context("failed to encode response")
+    }
+
+    #[instrument]
+    async fn handle_message(
+        &self,
+        async_nats::Message {
+            reply,
+            payload,
+            subject,
+            ..
+        }: async_nats::Message,
+    ) {
+        let res = self.handle_call(payload).await;
+        if let Err(e) = &res {
+            warn!("failed to handle `{subject}` request: {e:?}");
+        }
+        match (res, reply) {
+            (Ok(buf), Some(reply)) => {
+                if let Err(e) = self.nats.publish(reply, buf).await {
+                    error!("failed to publish success in response to `{subject}` request: {e:?}")
+                }
+            }
+            (Err(e), Some(reply)) => {
+                if let Err(e) = self
+                    .nats
+                    .publish(
+                        reply,
+                        format!(r#"{{"accepted":false,"error":"{e}"}}"#).into(),
+                    )
+                    .await
+                {
+                    error!("failed to publish error: {e:?}")
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Actor {
+    pool: ActorInstancePool,
+    instances: RwLock<HashMap<BTreeMap<String, String>, Vec<Arc<ActorInstance>>>>,
+    actor_ref: String,
 }
 
 /// Wasmbus lattice
 #[derive(Debug)]
 pub struct Lattice {
+    // TODO: Clean up actors after stop
+    actors: RwLock<HashMap<String, Arc<Actor>>>,
+    cluster_key: KeyPair,
     event_builder: EventBuilderV10,
     friendly_name: String,
+    heartbeat: AbortHandle,
     host_key: KeyPair,
     labels: HashMap<String, String>,
     nats: async_nats::Client,
+    providers: RwLock<HashMap<String, ()>>,
+    runtime: Runtime,
     start_at: Instant,
+    stop_tx: Mutex<Option<oneshot::Sender<Option<Instant>>>>,
+    stop_rx: oneshot::Receiver<Option<Instant>>,
+    queue: AbortHandle,
 }
 
 impl Lattice {
@@ -201,17 +388,34 @@ impl Lattice {
         let heartbeat =
             IntervalStream::new(interval_at(heartbeat_start_at, Self::HEARTBEAT_INTERVAL));
 
+        let (stop_tx, stop_rx) = oneshot::channel();
+
         let (queue_abort, queue_abort_reg) = AbortHandle::new_pair();
         let (heartbeat_abort, heartbeat_abort_reg) = AbortHandle::new_pair();
 
+        // TODO: Configure
+        let runtime = Runtime::builder()
+            .actor_config(wasmcloud_runtime::ActorConfig {
+                require_signature: true,
+            })
+            .build()
+            .context("failed to build runtime")?;
         let event_builder = EventBuilderV10::new().source(host_key.public_key());
         let wasmbus = Lattice {
+            actors: RwLock::default(),
+            cluster_key,
             event_builder,
             friendly_name,
+            heartbeat: heartbeat_abort.clone(),
             host_key,
             labels,
             nats,
+            providers: RwLock::default(),
+            runtime,
             start_at,
+            stop_rx,
+            stop_tx: Mutex::new(Some(stop_tx)),
+            queue: queue_abort.clone(),
         };
         wasmbus
             .publish_event("host_started", start_evt)
@@ -236,10 +440,8 @@ impl Lattice {
             Abortable::new(heartbeat, heartbeat_abort_reg).for_each(move |_| {
                 let wasmbus = Arc::clone(&wasmbus);
                 async move {
-                    if let Err(e) = wasmbus
-                        .publish_event("host_heartbeat", wasmbus.heartbeat())
-                        .await
-                    {
+                    let heartbeat = wasmbus.heartbeat().await;
+                    if let Err(e) = wasmbus.publish_event("host_heartbeat", heartbeat).await {
                         error!("failed to publish heartbeat: {e}");
                     }
                 }
@@ -261,10 +463,24 @@ impl Lattice {
         }))
     }
 
-    fn heartbeat(&self) -> serde_json::Value {
+    async fn heartbeat(&self) -> serde_json::Value {
+        let actors = self.actors.read().await;
+        let actors: HashMap<&String, usize> = stream::iter(actors.iter())
+            .filter_map(|(id, actor)| async move {
+                let instances = actor.instances.read().await;
+                let count = instances.values().map(Vec::len).sum();
+                if count == 0 {
+                    None
+                } else {
+                    Some((id, count))
+                }
+            })
+            .collect()
+            .await;
+        let _providers = &*self.providers.read().await;
         let uptime = self.start_at.elapsed();
         json!({
-            "actors": {}, // TODO
+            "actors": actors,
             "friendly_name": self.friendly_name,
             "labels": self.labels,
             "providers": [], // TODO
@@ -303,6 +519,180 @@ impl Lattice {
             .with_context(|| format!("failed to publish `{name}` event"))
     }
 
+    /// Instantiate an actor and publish the actor start events.
+    #[instrument(skip(host_id, actor_ref))]
+    async fn instantiate_actor(
+        &self,
+        claims: &jwt::Claims<jwt::Actor>,
+        annotations: &BTreeMap<String, String>,
+        host_id: impl AsRef<str>,
+        actor_ref: impl AsRef<str>,
+        count: NonZeroUsize,
+        pool: ActorInstancePool,
+    ) -> anyhow::Result<Vec<Arc<ActorInstance>>> {
+        let actor_ref = actor_ref.as_ref();
+        let instances = stream::repeat(format!("wasmbus.rpc.default.{}", claims.subject))
+            .take(count.into())
+            .then(|topic| {
+                let pool = pool.clone();
+                async move {
+                    let calls = self
+                        .nats
+                        .queue_subscribe(topic.clone(), topic)
+                        .await
+                        .context("failed to subscribe to actor call queue")?;
+
+                    let (calls_abort, calls_abort_reg) = AbortHandle::new_pair();
+                    let id = Ulid::new();
+                    let instance = Arc::new(ActorInstance {
+                        nats: self.nats.clone(),
+                        pool,
+                        id,
+                        calls: calls_abort,
+                    });
+
+                    let calls = spawn({
+                        let instance = Arc::clone(&instance);
+                        Abortable::new(calls, calls_abort_reg).for_each_concurrent(
+                            None,
+                            move |msg| {
+                                let instance = Arc::clone(&instance);
+                                async move { instance.handle_message(msg).await }
+                            },
+                        )
+                    });
+
+                    self.publish_event(
+                        "actor_started",
+                        event::actor_started(
+                            claims,
+                            annotations,
+                            Uuid::from_u128(id.into()),
+                            actor_ref,
+                        ),
+                    )
+                    .await?;
+                    anyhow::Result::<_>::Ok(instance)
+                }
+            })
+            .try_collect()
+            .await
+            .context("failed to instantiate actor")?;
+        self.publish_event(
+            "actors_started",
+            event::actors_started(claims, annotations, host_id, count, actor_ref),
+        )
+        .await?;
+        Ok(instances)
+    }
+
+    /// Uninstantiate an actor and publish the actor stop events.
+    #[instrument(skip(host_id))]
+    async fn uninstantiate_actor(
+        &self,
+        claims: &jwt::Claims<jwt::Actor>,
+        annotations: &BTreeMap<String, String>,
+        host_id: impl AsRef<str>,
+        instances: &mut Vec<Arc<ActorInstance>>,
+        count: NonZeroUsize,
+        remaining: usize,
+    ) -> anyhow::Result<()> {
+        stream::iter(instances.drain(..usize::from(count)))
+            .map(Ok)
+            .try_for_each_concurrent(None, |instance| {
+                instance.calls.abort();
+                async move {
+                    self.publish_event(
+                        "actor_stopped",
+                        event::actor_stopped(
+                            claims,
+                            annotations,
+                            Uuid::from_u128(instance.id.into()),
+                        ),
+                    )
+                    .await
+                }
+            })
+            .await?;
+        self.publish_event(
+            "actors_stopped",
+            event::actors_stopped(claims, annotations, host_id, count, remaining),
+        )
+        .await
+    }
+
+    #[instrument(skip(host_id, annotations))]
+    async fn start_actor<'a>(
+        &self,
+        entry: hash_map::VacantEntry<'a, String, Arc<Actor>>,
+        actor: wasmcloud_runtime::Actor,
+        actor_ref: String,
+        count: NonZeroUsize,
+        host_id: impl AsRef<str>,
+        annotations: impl Into<BTreeMap<String, String>>,
+    ) -> anyhow::Result<&'a mut Arc<Actor>> {
+        let annotations = annotations.into();
+        let claims = actor.claims().context("claims missing")?;
+
+        let pool = ActorInstancePool::new(actor.clone(), Some(count));
+        let instances = self
+            .instantiate_actor(
+                claims,
+                &annotations,
+                host_id,
+                &actor_ref,
+                count,
+                pool.clone(),
+            )
+            .await
+            .context("failed to instantiate actor")?;
+        let actor = Arc::new(Actor {
+            pool,
+            instances: RwLock::new(HashMap::from([(annotations, instances)])),
+            actor_ref,
+        });
+        Ok(entry.insert(actor))
+    }
+
+    #[instrument(skip(host_id))]
+    async fn stop_actor<'a>(
+        &self,
+        entry: hash_map::OccupiedEntry<'a, String, Arc<Actor>>,
+        host_id: impl AsRef<str>,
+    ) -> anyhow::Result<()> {
+        let host_id = host_id.as_ref();
+        let actor = entry.remove();
+        let claims = actor.pool.claims().context("claims missing")?;
+        let mut instances = actor.instances.write().await;
+        let remaining: usize = instances.values().map(Vec::len).sum();
+        stream::iter(instances.drain())
+            .map(anyhow::Result::<_>::Ok)
+            .try_fold(
+                remaining,
+                |remaining, (annotations, mut instances)| async move {
+                    let Some(count) = NonZeroUsize::new(instances.len()) else {
+                        return Ok(remaining)
+                    };
+                    let remaining = remaining
+                        .checked_sub(count.into())
+                        .context("invalid instance length")?;
+                    self.uninstantiate_actor(
+                        claims,
+                        &annotations,
+                        host_id,
+                        &mut instances,
+                        count,
+                        remaining,
+                    )
+                    .await
+                    .context("failed to uninstantiate actor")?;
+                    Ok(remaining)
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     #[instrument(skip(payload))]
     async fn handle_auction_actor(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
         #[derive(Deserialize)]
@@ -318,10 +708,15 @@ impl Lattice {
 
         debug!(actor_ref, ?constraints, "auction actor");
 
-        bail!("TODO");
+        let buf = serde_json::to_vec(&json!({
+          "actor_ref": actor_ref,
+          "constraints": constraints,
+          "host_id": self.host_key.public_key(),
+        }))
+        .context("failed to encode reply")?;
+        Ok(buf.into())
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_auction_provider(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
         debug!("auction provider");
@@ -330,7 +725,11 @@ impl Lattice {
     }
 
     #[instrument(skip(payload))]
-    async fn handle_stop(&self, payload: impl AsRef<[u8]>, host_id: &str) -> anyhow::Result<Bytes> {
+    async fn handle_stop(
+        &self,
+        payload: impl AsRef<[u8]>,
+        _host_id: &str,
+    ) -> anyhow::Result<Bytes> {
         #[derive(Deserialize)]
         struct Command {
             timeout: u64, // ms
@@ -340,7 +739,14 @@ impl Lattice {
 
         debug!(timeout, "stop host");
 
-        bail!("TODO");
+        self.heartbeat.abort();
+        self.queue.abort();
+        let mut stop_tx = self.stop_tx.lock().await;
+        let stop_tx = stop_tx.take().context("already stopped")?;
+        stop_tx
+            .send(Instant::now().checked_add(Duration::from_millis(timeout)))
+            .map_err(|_| anyhow!("failed to stop"))?;
+        Ok(SUCCESS.into())
     }
 
     #[instrument(skip(payload))]
@@ -364,7 +770,88 @@ impl Lattice {
 
         debug!(actor_id, actor_ref, count, "scale actor");
 
-        bail!("TODO");
+        let actor_id = if actor_id.is_empty() {
+            let actor = fetch_actor(&actor_ref)
+                .await
+                .context("failed to fetch actor")?;
+            let actor = wasmcloud_runtime::Actor::new(&self.runtime, actor)
+                .context("failed to initialize actor")?;
+            actor.claims().context("claims missing")?.subject.clone()
+        } else {
+            actor_id
+        };
+
+        let annotations = BTreeMap::default();
+        use std::collections::hash_map::Entry;
+        match (
+            self.actors.write().await.entry(actor_id),
+            NonZeroUsize::new(count),
+        ) {
+            (Entry::Vacant(_), None) => {}
+            (Entry::Vacant(entry), Some(count)) => {
+                let actor = fetch_actor(&actor_ref)
+                    .await
+                    .context("failed to fetch actor")?;
+                let actor = wasmcloud_runtime::Actor::new(&self.runtime, actor)
+                    .context("failed to initialize actor")?;
+                self.start_actor(entry, actor, actor_ref, count, host_id, annotations)
+                    .await?;
+            }
+            (Entry::Occupied(entry), None) => {
+                self.stop_actor(entry, host_id).await?;
+            }
+            (Entry::Occupied(mut entry), Some(count)) => {
+                let actor = entry.get();
+                let mut instances = actor.instances.write().await;
+                let count = usize::from(count);
+                let current = instances.values().map(Vec::len).sum();
+                let claims = actor.pool.claims().context("claims missing")?;
+                if let Some(delta) = count.checked_sub(current).and_then(NonZeroUsize::new) {
+                    let mut delta = self
+                        .instantiate_actor(
+                            claims,
+                            &annotations,
+                            host_id,
+                            &actor.actor_ref,
+                            delta,
+                            actor.pool.clone(),
+                        )
+                        .await
+                        .context("failed to instantiate actor")?;
+                    instances.entry(annotations).or_default().append(&mut delta);
+                } else if let Some(delta) = current.checked_sub(count).and_then(NonZeroUsize::new) {
+                    let mut remaining = current;
+                    let mut delta = usize::from(delta);
+                    for (annotations, instances) in instances.iter_mut() {
+                        let Some(count) = NonZeroUsize::new(instances.len().min(delta)) else {
+                            continue;
+                        };
+                        remaining = remaining
+                            .checked_sub(count.into())
+                            .context("invalid instance length")?;
+                        delta = delta.checked_sub(count.into()).context("invalid delta")?;
+                        self.uninstantiate_actor(
+                            claims,
+                            annotations,
+                            host_id,
+                            instances,
+                            count,
+                            remaining,
+                        )
+                        .await
+                        .context("failed to uninstantiate actor")?;
+                        if delta == 0 {
+                            break;
+                        }
+                    }
+                    if remaining == 0 {
+                        drop(instances);
+                        entry.remove();
+                    }
+                }
+            }
+        }
+        Ok(SUCCESS.into())
     }
 
     #[instrument(skip(payload))]
@@ -389,7 +876,43 @@ impl Lattice {
 
         debug!(actor_ref, count, ?annotations, "launch actor");
 
-        bail!("TODO");
+        let Some(count) = NonZeroUsize::new(count) else {
+            // NOTE: This mimics OTP behavior
+            // TODO: actors started
+            return Ok(SUCCESS.into())
+        };
+
+        let actor = fetch_actor(&actor_ref)
+            .await
+            .context("failed to fetch actor")?;
+        let actor = wasmcloud_runtime::Actor::new(&self.runtime, actor)
+            .context("failed to initialize actor")?;
+        let claims = actor.claims().context("claims missing")?;
+        use std::collections::hash_map::Entry;
+        match self.actors.write().await.entry(claims.subject.clone()) {
+            Entry::Vacant(entry) => {
+                self.start_actor(entry, actor, actor_ref, count, host_id, annotations)
+                    .await?;
+            }
+            Entry::Occupied(mut entry) => {
+                let actor = entry.get();
+                let mut instances = actor.instances.write().await;
+                let claims = actor.pool.claims().context("claims missing")?;
+                let mut delta = self
+                    .instantiate_actor(
+                        claims,
+                        &annotations,
+                        host_id,
+                        &actor.actor_ref,
+                        count,
+                        actor.pool.clone(),
+                    )
+                    .await
+                    .context("failed to instantiate actor")?;
+                instances.entry(annotations).or_default().append(&mut delta);
+            }
+        }
+        Ok(SUCCESS.into())
     }
 
     #[instrument(skip(payload))]
@@ -414,7 +937,54 @@ impl Lattice {
 
         debug!(actor_ref, count, ?annotations, "stop actor");
 
-        bail!("TODO");
+        use std::collections::hash_map::Entry;
+        match (
+            self.actors.write().await.entry(actor_ref),
+            NonZeroUsize::new(count),
+        ) {
+            (Entry::Occupied(entry), None) => {
+                self.stop_actor(entry, host_id).await?;
+            }
+            (Entry::Occupied(mut entry), Some(count)) => {
+                let actor = entry.get();
+                let mut instances = actor.instances.write().await;
+                let current: usize = instances.values().map(Vec::len).sum();
+                let claims = actor.pool.claims().context("claims missing")?;
+                let mut remaining = current;
+                let mut delta = current.min(count.into());
+                for (annotations, instances) in instances.iter_mut() {
+                    let Some(count) = NonZeroUsize::new(instances.len().min(delta)) else {
+                            continue;
+                        };
+                    remaining = remaining
+                        .checked_sub(count.into())
+                        .context("invalid instance length")?;
+                    delta = delta.checked_sub(count.into()).context("invalid delta")?;
+                    self.uninstantiate_actor(
+                        claims,
+                        annotations,
+                        host_id,
+                        instances,
+                        count,
+                        remaining,
+                    )
+                    .await
+                    .context("failed to uninstantiate actor")?;
+                    if delta == 0 {
+                        break;
+                    }
+                }
+                if remaining == 0 {
+                    drop(instances);
+                    entry.remove();
+                }
+            }
+            _ => {
+                // NOTE: This mimics OTP behavior
+                // TODO: What does OTP do?
+            }
+        }
+        Ok(SUCCESS.into())
     }
 
     #[instrument(skip(payload))]
@@ -432,7 +1002,7 @@ impl Lattice {
 
         debug!(new_actor_ref, "update actor");
 
-        bail!("TODO");
+        bail!("TODO: update actor");
     }
 
     #[instrument(skip(payload))]
@@ -459,7 +1029,6 @@ impl Lattice {
         bail!("TODO");
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_stop_provider(
         &self,
@@ -469,50 +1038,110 @@ impl Lattice {
         bail!("TODO")
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_inventory(
         &self,
         payload: impl AsRef<[u8]>,
         host_id: &str,
     ) -> anyhow::Result<Bytes> {
-        bail!("TODO")
+        let actors = self.actors.read().await;
+        let actors: Vec<_> = stream::iter(actors.iter())
+            .filter_map(|(id, actor)| async move {
+                let instances = actor.instances.read().await;
+                let instances: Vec<_> = instances
+                    .iter()
+                    .flat_map(|(annotations, instances)| {
+                        instances.iter().map(move |actor| {
+                            json!({
+                                "annotations": annotations,
+                                "instance_id": Uuid::from_u128(actor.id.into()),
+                                "revision": 0, // TODO
+                            })
+                        })
+                    })
+                    .collect();
+                if instances.is_empty() {
+                    return None;
+                }
+                if let Some(name) = actor
+                    .pool
+                    .claims()
+                    .and_then(|claims| claims.metadata.as_ref())
+                    .and_then(|metadata| metadata.name.as_ref())
+                {
+                    Some(json!({
+                        "id": id,
+                        "image_ref": actor.actor_ref,
+                        "instances": instances,
+                        "name": name,
+                    }))
+                } else {
+                    Some(json!({
+                        "id": id,
+                        "image_ref": actor.actor_ref,
+                        "instances": instances,
+                    }))
+                }
+            })
+            .collect()
+            .await;
+        let buf = serde_json::to_vec(&json!({
+          "host_id": self.host_key.public_key(),
+          "issuer": self.cluster_key.public_key(),
+          "labels": self.labels,
+          "friendly_name": self.friendly_name,
+          "actors": actors,
+          "providers": [], // TODO
+        }))
+        .context("failed to encode reply")?;
+        Ok(buf.into())
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_claims(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
         bail!("TODO")
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_links(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
         bail!("TODO")
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_linkdef_put(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
         bail!("TODO")
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_linkdef_del(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
         bail!("TODO")
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_registries_put(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
         bail!("TODO")
     }
 
-    #[allow(unused)] // TODO: Remove once implemented
     #[instrument(skip(payload))]
     async fn handle_ping_hosts(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<Bytes> {
-        bail!("TODO")
+        let uptime = self.start_at.elapsed();
+        let buf = serde_json::to_vec(&json!({
+          "id": self.host_key.public_key(),
+          "issuer": self.cluster_key.public_key(),
+          "labels": self.labels,
+          "friendly_name": self.friendly_name,
+          "uptime_seconds": uptime.as_secs(),
+          "uptime_human": "TODO",
+          "version": env!("CARGO_PKG_VERSION"),
+          "cluster_issuers": "TODO",
+          "js_domain": "TODO",
+          "ctl_host": "TODO",
+          "prov_rpc_host": "TODO",
+          "rpc_host": "TODO",
+          "lattice_prefix": "default",
+        }))
+        .context("failed to encode reply")?;
+        Ok(buf.into())
     }
 
     #[instrument]
