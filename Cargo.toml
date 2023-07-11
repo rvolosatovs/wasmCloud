@@ -83,7 +83,7 @@ uuid = { version = "1.3.0", default-features = false }
 wascap = { version = "0.10.0", default-features = false }
 wasi-cap-std-sync = { git = "https://github.com/bytecodealliance/preview2-prototyping", rev = "24fa023d1848ca3a24b35ed80ff1514ea54dd219", default-features = false }
 wasi-common = { git = "https://github.com/bytecodealliance/preview2-prototyping", rev = "24fa023d1848ca3a24b35ed80ff1514ea54dd219", default-features = false }
-wasm-compose = { version = "0.2.11", default-features = false }
+wasm-compose = { version = "0.2.17", default-features = false }
 wasmbus-rpc = { version = "0.11.2", default-features = false }
 wasmcloud = { path = "." }
 wasmcloud-example-runner = { version = "0.4.0", default-features = false }
