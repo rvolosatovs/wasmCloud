@@ -48,7 +48,7 @@ struct Lock {
 }
 
 static LOCK: Lazy<Lock> = Lazy::new(|| {
-    serde_json::from_str(include_str!("../../flake.lock")).expect("failed to parse `flake.lock`")
+    serde_json::from_str(include_str!("../flake.lock")).expect("failed to parse `flake.lock`")
 });
 
 static WASI_PREVIEW1_COMMAND_COMPONENT_ADAPTER_LOCK: Lazy<&LockNodeEntry> =
@@ -160,7 +160,7 @@ async fn upsert_artifact(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("cargo:rerun-if-changed=../../flake.lock");
+    println!("cargo:rerun-if-changed=../flake.lock");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=WASI_PREVIEW1_COMMAND_COMPONENT_ADAPTER");
     println!("cargo:rerun-if-env-changed=WASI_PREVIEW1_REACTOR_COMPONENT_ADAPTER");
