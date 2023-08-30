@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 
 use serde::Deserialize;
 use serde_json::json;
-use wasi::http::http_types as types;
+use wasi::http::types;
 use wasmcloud_actor::wasi::logging::logging;
 use wasmcloud_actor::wasi::random::random;
 use wasmcloud_actor::wasi::{blobstore, keyvalue};
