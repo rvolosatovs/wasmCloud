@@ -195,14 +195,6 @@ jobs:
         username: ${{ secrets.DOCKERHUB_PUSH_USER }}
         password: ${{ secrets.DOCKERHUB_PUSH_PASSWORD }}
 
-    - name: Login to AzureCR
-      if: startswith(github.ref, 'refs/tags/')
-      uses: azure/docker-login@v1
-      with:
-        login-server: ${{ secrets.AZURECR_PUSH_URL }}
-        username: ${{ secrets.AZURECR_PUSH_USER }}
-        password: ${{ secrets.AZURECR_PUSH_PASSWORD }}
-
     - run: |
         nix run -L .#build-wasmcloud-oci wasmcloud
         nix profile install --inputs-from . 'nixpkgs#buildah'
@@ -220,11 +212,9 @@ jobs:
       run: |
         buildah manifest push --storage-driver=vfs --all --format 'v2s2' wasmcloud docker://${{ steps.ctx.outputs.package }}:${{ steps.ctx.outputs.version }}
         buildah manifest push --storage-driver=vfs --all --format 'v2s2' wasmcloud docker://ghcr.io/${{ steps.ctx.outputs.package }}:${{ steps.ctx.outputs.version }}
-        buildah manifest push --storage-driver=vfs --all --format 'v2s2' wasmcloud docker://wasmcloud.azurecr.io/${{ steps.ctx.outputs.package }}:${{ steps.ctx.outputs.version }}
 
         docker run ${{ steps.ctx.outputs.package }}:${{ steps.ctx.outputs.version }} wasmcloud --version
         docker run ghcr.io/${{ steps.ctx.outputs.package }}:${{ steps.ctx.outputs.version }} wasmcloud --version
-        docker run wasmcloud.azurecr.io/${{ steps.ctx.outputs.package }}:${{ steps.ctx.outputs.version }} wasmcloud --version
 
   # TODO: Push `latest`
 
