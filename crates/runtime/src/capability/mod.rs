@@ -5,7 +5,7 @@ pub mod provider;
 
 pub use builtin::{
     ActorIdentifier, Blobstore, Bus, IncomingHttp, KeyValueAtomic, KeyValueReadWrite, Logging,
-    Messaging, TargetEntity, TargetInterface,
+    Messaging, OutgoingHttp, TargetEntity, TargetInterface,
 };
 
 #[allow(clippy::doc_markdown)]

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context};
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
 use wasmtime_wasi::preview2::pipe::{AsyncReadStream, AsyncWriteStream};
 use wasmtime_wasi::preview2::{self, TableStreamExt};

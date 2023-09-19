@@ -1,7 +1,7 @@
 use super::{Ctx, Instance, InterfaceBindings, InterfaceInstance, TableResult};
 
-use crate::capability::http::types;
-use crate::capability::IncomingHttp;
+use crate::capability::http::{outgoing_handler, types};
+use crate::capability::{IncomingHttp, OutgoingHttp};
 use crate::io::AsyncVec;
 
 use std::collections::BTreeMap;
@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _};
 use async_trait::async_trait;
+use http::Uri;
 use tokio::io::{AsyncRead, AsyncSeekExt};
 use tokio::sync::Mutex;
 use tracing::instrument;
@@ -30,6 +31,15 @@ struct IncomingRequest {
     authority: Option<String>,
     headers: types::Headers,
     body: Box<dyn AsyncRead + Sync + Send + Unpin>,
+}
+
+struct OutgoingRequest {
+    method: types::Method,
+    path_with_query: Option<String>,
+    scheme: Option<types::Scheme>,
+    authority: Option<String>,
+    headers: types::Headers,
+    body: AsyncVec,
 }
 
 struct OutgoingResponse {
@@ -63,6 +73,19 @@ trait TableKeyValueExt {
         &mut self,
         request: types::IncomingRequest,
     ) -> TableResult<IncomingRequest>;
+
+    fn push_outgoing_request(
+        &mut self,
+        request: OutgoingRequest,
+    ) -> TableResult<types::OutgoingRequest>;
+    fn get_outgoing_request(
+        &self,
+        request: types::OutgoingRequest,
+    ) -> TableResult<&OutgoingRequest>;
+    fn delete_outgoing_request(
+        &mut self,
+        request: types::OutgoingRequest,
+    ) -> TableResult<OutgoingRequest>;
 
     fn new_response_outparam(&mut self) -> TableResult<types::ResponseOutparam>;
     fn get_response_outparam_mut(
@@ -132,6 +155,27 @@ impl TableKeyValueExt for preview2::Table {
         &mut self,
         request: types::IncomingRequest,
     ) -> TableResult<IncomingRequest> {
+        self.delete(request)
+    }
+
+    fn push_outgoing_request(
+        &mut self,
+        request: OutgoingRequest,
+    ) -> TableResult<types::OutgoingRequest> {
+        self.push(Box::new(request))
+    }
+
+    fn get_outgoing_request(
+        &self,
+        request: types::OutgoingRequest,
+    ) -> TableResult<&OutgoingRequest> {
+        self.get(request)
+    }
+
+    fn delete_outgoing_request(
+        &mut self,
+        request: types::OutgoingRequest,
+    ) -> TableResult<OutgoingRequest> {
         self.delete(request)
     }
 
@@ -348,13 +392,14 @@ impl types::Host for Ctx {
             .context("failed to delete incoming request")?;
         Ok(())
     }
-    #[allow(unused)] // TODO: Remove
+
     async fn drop_outgoing_request(
         &mut self,
         request: types::OutgoingRequest,
     ) -> anyhow::Result<()> {
         bail!("outgoing HTTP not supported yet")
     }
+
     async fn incoming_request_method(
         &mut self,
         request: types::IncomingRequest,
@@ -365,6 +410,7 @@ impl types::Host for Ctx {
             .context("failed to get incoming request")?;
         Ok(method.clone())
     }
+
     async fn incoming_request_path_with_query(
         &mut self,
         request: types::IncomingRequest,
@@ -377,6 +423,7 @@ impl types::Host for Ctx {
             .context("failed to get incoming request")?;
         Ok(path_with_query.clone())
     }
+
     async fn incoming_request_scheme(
         &mut self,
         request: types::IncomingRequest,
@@ -387,6 +434,7 @@ impl types::Host for Ctx {
             .context("failed to get incoming request")?;
         Ok(scheme.clone())
     }
+
     async fn incoming_request_authority(
         &mut self,
         request: types::IncomingRequest,
@@ -397,6 +445,7 @@ impl types::Host for Ctx {
             .context("failed to get incoming request")?;
         Ok(authority.clone())
     }
+
     async fn incoming_request_headers(
         &mut self,
         request: types::IncomingRequest,
@@ -407,6 +456,7 @@ impl types::Host for Ctx {
             .context("failed to get incoming request")?;
         Ok(*headers)
     }
+
     async fn incoming_request_consume(
         &mut self,
         request: types::IncomingRequest,
@@ -421,7 +471,7 @@ impl types::Host for Ctx {
             .context("failed to push input stream")?;
         Ok(Ok(stream))
     }
-    #[allow(unused)] // TODO: Remove
+
     async fn new_outgoing_request(
         &mut self,
         method: types::Method,
@@ -430,15 +480,35 @@ impl types::Host for Ctx {
         authority: Option<String>,
         headers: types::Headers,
     ) -> anyhow::Result<Result<types::OutgoingRequest, types::Error>> {
-        bail!("outgoing HTTP not supported yet")
+        let req = self
+            .table
+            .push_outgoing_request(OutgoingRequest {
+                method,
+                path_with_query,
+                scheme,
+                authority,
+                headers,
+                body: AsyncVec::default(),
+            })
+            .context("failed to push outgoing request")?;
+        Ok(Ok(req))
     }
-    #[allow(unused)] // TODO: Remove
+
     async fn outgoing_request_write(
         &mut self,
         request: types::OutgoingRequest,
     ) -> anyhow::Result<Result<types::OutgoingStream, ()>> {
-        bail!("outgoing HTTP not supported yet")
+        let OutgoingRequest { body, .. } = self
+            .table
+            .get_outgoing_request(request)
+            .context("failed to get outgoing request")?;
+        let stream = self
+            .table
+            .push_output_stream(Box::new(AsyncWriteStream::new(1 << 16, body.clone())))
+            .context("failed to push output stream")?;
+        Ok(Ok(stream))
     }
+
     async fn drop_response_outparam(
         &mut self,
         response: types::ResponseOutparam,
@@ -448,6 +518,7 @@ impl types::Host for Ctx {
             .context("failed to delete outgoing response parameter")?;
         Ok(())
     }
+
     async fn set_response_outparam(
         &mut self,
         param: types::ResponseOutparam,
@@ -461,13 +532,13 @@ impl types::Host for Ctx {
         Ok(Ok(()))
     }
 
-    #[allow(unused)] // TODO: Remove
     async fn drop_incoming_response(
         &mut self,
         response: types::IncomingResponse,
     ) -> anyhow::Result<()> {
         bail!("outgoing HTTP not supported yet")
     }
+
     async fn drop_outgoing_response(
         &mut self,
         response: types::OutgoingResponse,
@@ -477,27 +548,28 @@ impl types::Host for Ctx {
             .context("failed to delete outgoing response")?;
         Ok(())
     }
-    #[allow(unused)] // TODO: Remove
+
     async fn incoming_response_status(
         &mut self,
         response: types::IncomingResponse,
     ) -> anyhow::Result<types::StatusCode> {
         bail!("outgoing HTTP not supported yet")
     }
-    #[allow(unused)] // TODO: Remove
+
     async fn incoming_response_headers(
         &mut self,
         response: types::IncomingResponse,
     ) -> anyhow::Result<types::Headers> {
         bail!("outgoing HTTP not supported yet")
     }
-    #[allow(unused)] // TODO: Remove
+
     async fn incoming_response_consume(
         &mut self,
         response: types::IncomingResponse,
     ) -> anyhow::Result<Result<types::IncomingStream, ()>> {
         bail!("outgoing HTTP not supported yet")
     }
+
     async fn new_outgoing_response(
         &mut self,
         status_code: types::StatusCode,
@@ -513,6 +585,7 @@ impl types::Host for Ctx {
             .context("failed to push fields")?;
         Ok(Ok(response))
     }
+
     async fn outgoing_response_write(
         &mut self,
         response: types::OutgoingResponse,
@@ -551,6 +624,73 @@ impl types::Host for Ctx {
     }
 }
 
+#[async_trait]
+impl outgoing_handler::Host for Ctx {
+    #[instrument]
+    async fn handle(
+        &mut self,
+        request: types::OutgoingRequest,
+        options: Option<types::RequestOptions>,
+    ) -> anyhow::Result<types::FutureIncomingResponse> {
+        let OutgoingRequest {
+            method,
+            path_with_query,
+            scheme,
+            authority,
+            headers,
+            body,
+        } = self
+            .table
+            .delete_outgoing_request(request)
+            .context("failed to delete outgoing request")?;
+        let method = match method {
+            types::Method::Get => http::Method::GET,
+            types::Method::Head => http::Method::HEAD,
+            types::Method::Post => http::Method::POST,
+            types::Method::Put => http::Method::PUT,
+            types::Method::Delete => http::Method::DELETE,
+            types::Method::Connect => http::Method::CONNECT,
+            types::Method::Options => http::Method::OPTIONS,
+            types::Method::Trace => http::Method::TRACE,
+            types::Method::Patch => http::Method::PATCH,
+        };
+        let uri = Uri::builder();
+        let uri = if let Some(path_with_query) = path_with_query {
+            uri.path_and_query(path_with_query)
+        } else {
+            uri
+        };
+        let uri = match scheme {
+            None => uri,
+            Some(types::Scheme::Http) => uri.scheme("http"),
+            Some(types::Scheme::Https) => uri.scheme("https"),
+            Some(types::Scheme::Other(other)) => uri.scheme(other.as_str()),
+        };
+        let uri = if let Some(authority) = authority {
+            uri.authority(authority)
+        } else {
+            uri
+        };
+        let uri = uri.build().context("failed to build URI")?;
+        let req = http::Request::builder().method(method).uri(uri);
+        let mut data = self.store.data_mut();
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| {
+                let name = name.context("invalid header name")?;
+                Ok((name.as_str().into(), vec![value.as_bytes().into()]))
+            })
+            .collect::<anyhow::Result<_>>()
+            .context("failed to parse headers")?;
+        let headers = data
+            .table
+            .push_fields(headers)
+            .context("failed to push headers")?;
+        //self.handler.handle(, options)
+        bail!("TODO")
+    }
+}
+
 impl Instance {
     /// Set [`IncomingHttp`] handler for this [Instance].
     pub fn incoming_http(
@@ -558,6 +698,15 @@ impl Instance {
         incoming_http: Arc<dyn IncomingHttp + Send + Sync>,
     ) -> &mut Self {
         self.handler_mut().replace_incoming_http(incoming_http);
+        self
+    }
+
+    /// Set [`OutgoingHttp`] handler for this [Instance].
+    pub fn outgoing_http(
+        &mut self,
+        outgoing_http: Arc<dyn OutgoingHttp + Send + Sync>,
+    ) -> &mut Self {
+        self.handler_mut().replace_outgoing_http(outgoing_http);
         self
     }
 
@@ -593,7 +742,6 @@ impl Instance {
 
 #[async_trait]
 impl IncomingHttp for InterfaceInstance<incoming_http_bindings::IncomingHttp> {
-    #[allow(unused)] // TODO: Remove
     #[instrument(skip_all)]
     async fn handle(
         &self,

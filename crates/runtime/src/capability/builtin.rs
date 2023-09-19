@@ -1,5 +1,5 @@
 use super::logging::logging;
-use super::{blobstore, bus, format_opt, messaging};
+use super::{blobstore, bus, format_opt, http, messaging};
 
 use core::convert::Infallible;
 use core::fmt::Debug;
@@ -23,6 +23,7 @@ pub struct Handler {
     blobstore: Option<Arc<dyn Blobstore + Sync + Send>>,
     bus: Option<Arc<dyn Bus + Sync + Send>>,
     incoming_http: Option<Arc<dyn IncomingHttp + Sync + Send>>,
+    outgoing_http: Option<Arc<dyn OutgoingHttp + Sync + Send>>,
     keyvalue_atomic: Option<Arc<dyn KeyValueAtomic + Sync + Send>>,
     keyvalue_readwrite: Option<Arc<dyn KeyValueReadWrite + Sync + Send>>,
     logging: Option<Arc<dyn Logging + Sync + Send>>,
@@ -39,6 +40,7 @@ impl Debug for Handler {
             .field("keyvalue_readwrite", &format_opt(&self.keyvalue_readwrite))
             .field("logging", &format_opt(&self.logging))
             .field("messaging", &format_opt(&self.messaging))
+            .field("outgoing_http", &format_opt(&self.outgoing_http))
             .finish()
     }
 }
@@ -136,6 +138,14 @@ impl Handler {
     ) -> Option<Arc<dyn Messaging + Send + Sync>> {
         self.messaging.replace(messaging)
     }
+
+    /// Replace [`OutgoingHttp`] handler returning the old one, if such was set
+    pub fn replace_outgoing_http(
+        &mut self,
+        outgoing_http: Arc<dyn OutgoingHttp + Send + Sync>,
+    ) -> Option<Arc<dyn OutgoingHttp + Send + Sync>> {
+        self.outgoing_http.replace(outgoing_http)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +228,8 @@ impl TryFrom<bus::lattice::TargetEntity> for TargetEntity {
 pub enum TargetInterface {
     /// `wasi:blobstore/blobstore`
     WasiBlobstoreBlobstore,
+    /// `wasi:http/outgoing-handler`
+    WasiHttpOutgoingHandler,
     /// `wasi:keyvalue/atomic`
     WasiKeyvalueAtomic,
     /// `wasi:keyvalue/readwrite`
@@ -287,8 +299,8 @@ pub trait IncomingHttp {
     /// Handle `wasi:http/incoming-handler`
     async fn handle(
         &self,
-        request: http::Request<Box<dyn AsyncRead + Sync + Send + Unpin>>,
-    ) -> anyhow::Result<http::Response<Box<dyn AsyncRead + Sync + Send + Unpin>>>;
+        request: ::http::Request<Box<dyn AsyncRead + Sync + Send + Unpin>>,
+    ) -> anyhow::Result<::http::Response<Box<dyn AsyncRead + Sync + Send + Unpin>>>;
 }
 
 #[async_trait]
@@ -433,6 +445,17 @@ pub trait Messaging {
 
     /// Handle `wasmcloud:messaging/consumer.publish`
     async fn publish(&self, msg: messaging::types::BrokerMessage) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+/// `wasi:http/outgoing-handler` implementation
+pub trait OutgoingHttp {
+    /// Handle `wasi:http/outgoing-handler`
+    async fn handle(
+        &self,
+        request: ::http::Request<Box<dyn AsyncRead + Sync + Send + Unpin>>,
+        options: Option<http::types::RequestOptions>,
+    ) -> anyhow::Result<::http::Response<Box<dyn AsyncRead + Sync + Send + Unpin>>>;
 }
 
 #[async_trait]
@@ -674,8 +697,8 @@ impl IncomingHttp for Handler {
     #[instrument(skip(request))]
     async fn handle(
         &self,
-        request: http::Request<Box<dyn AsyncRead + Sync + Send + Unpin>>,
-    ) -> anyhow::Result<http::Response<Box<dyn AsyncRead + Sync + Send + Unpin>>> {
+        request: ::http::Request<Box<dyn AsyncRead + Sync + Send + Unpin>>,
+    ) -> anyhow::Result<::http::Response<Box<dyn AsyncRead + Sync + Send + Unpin>>> {
         proxy(
             &self.incoming_http,
             "IncomingHttp",
@@ -721,6 +744,24 @@ impl Messaging for Handler {
     }
 }
 
+#[async_trait]
+impl OutgoingHttp for Handler {
+    #[instrument(skip(request))]
+    async fn handle(
+        &self,
+        request: ::http::Request<Box<dyn AsyncRead + Sync + Send + Unpin>>,
+        options: Option<http::types::RequestOptions>,
+    ) -> anyhow::Result<::http::Response<Box<dyn AsyncRead + Sync + Send + Unpin>>> {
+        proxy(
+            &self.outgoing_http,
+            "OutgoingHttp",
+            "wasi:http/outgoing-handler.handle",
+        )?
+        .handle(request, options)
+        .await
+    }
+}
+
 /// A [Handler] builder used to configure it
 #[derive(Clone, Default)]
 pub(crate) struct HandlerBuilder {
@@ -738,6 +779,8 @@ pub(crate) struct HandlerBuilder {
     pub logging: Option<Arc<dyn Logging + Sync + Send>>,
     /// [`Messaging`] handler
     pub messaging: Option<Arc<dyn Messaging + Sync + Send>>,
+    /// [`OutgoingHttp`] handler
+    pub outgoing_http: Option<Arc<dyn OutgoingHttp + Sync + Send>>,
 }
 
 impl HandlerBuilder {
@@ -805,6 +848,17 @@ impl HandlerBuilder {
             ..self
         }
     }
+
+    /// Set [`OutgoingHttp`] handler
+    pub fn outgoing_http(
+        self,
+        outgoing_http: Arc<impl OutgoingHttp + Sync + Send + 'static>,
+    ) -> Self {
+        Self {
+            outgoing_http: Some(outgoing_http),
+            ..self
+        }
+    }
 }
 
 impl Debug for HandlerBuilder {
@@ -817,6 +871,7 @@ impl Debug for HandlerBuilder {
             .field("keyvalue_readwrite", &format_opt(&self.keyvalue_readwrite))
             .field("logging", &format_opt(&self.logging))
             .field("messaging", &format_opt(&self.messaging))
+            .field("outgoing_http", &format_opt(&self.outgoing_http))
             .finish()
     }
 }
@@ -831,6 +886,7 @@ impl From<Handler> for HandlerBuilder {
             keyvalue_readwrite,
             logging,
             messaging,
+            outgoing_http,
         }: Handler,
     ) -> Self {
         Self {
@@ -841,6 +897,7 @@ impl From<Handler> for HandlerBuilder {
             keyvalue_readwrite,
             logging,
             messaging,
+            outgoing_http,
         }
     }
 }
@@ -855,6 +912,7 @@ impl From<HandlerBuilder> for Handler {
             keyvalue_readwrite,
             logging,
             messaging,
+            outgoing_http,
         }: HandlerBuilder,
     ) -> Self {
         Self {
@@ -865,6 +923,7 @@ impl From<HandlerBuilder> for Handler {
             keyvalue_readwrite,
             logging,
             messaging,
+            outgoing_http,
         }
     }
 }
