@@ -1906,13 +1906,20 @@ impl Host {
         let host = Arc::new(host);
         let queue = spawn({
             let host = Arc::clone(&host);
-            async {
-                Abortable::new(queue, queue_abort_reg)
-                    .for_each(move |msg| {
-                        let host = Arc::clone(&host);
-                        async move { host.handle_message(msg).await }
-                    })
-                    .await;
+            async move {
+                let host = Arc::clone(&host);
+                {
+                    let host = Arc::clone(&host);
+                    Abortable::new(queue, queue_abort_reg)
+                        .for_each(move |msg| {
+                            let host = Arc::clone(&host);
+                            async move { host.handle_message(msg).await }
+                        })
+                        .await;
+                }
+                let deadline = { *host.stop_rx.borrow() };
+                host.stop_tx.send_replace(deadline);
+                info!("control interface queue task stopped");
             }
         });
         let data_watch: JoinHandle<anyhow::Result<_>> = spawn({
@@ -1922,33 +1929,53 @@ impl Host {
                     .watch_with_history(">")
                     .await
                     .context("failed to watch lattice data bucket")?;
-                Abortable::new(data_watch, data_watch_abort_reg)
-                    .for_each(move |entry| {
-                        let host = Arc::clone(&host);
-                        async move {
-                            match entry {
-                                Err(error) => {
-                                    error!("failed to watch lattice data bucket: {error}");
+                let host = Arc::clone(&host);
+                {
+                    let host = Arc::clone(&host);
+                    Abortable::new(data_watch, data_watch_abort_reg)
+                        .for_each(move |entry| {
+                            let host = Arc::clone(&host);
+                            async move {
+                                match entry {
+                                    Err(error) => {
+                                        error!("failed to watch lattice data bucket: {error}");
+                                    }
+                                    Ok(entry) => host.process_entry(entry).await,
                                 }
-                                Ok(entry) => host.process_entry(entry).await,
                             }
-                        }
-                    })
-                    .await;
+                        })
+                        .await;
+                }
+                let deadline = { *host.stop_rx.borrow() };
+                host.stop_tx.send_replace(deadline);
+                info!("data watch task stopped");
                 Ok(())
             }
         });
         let heartbeat = spawn({
             let host = Arc::clone(&host);
-            Abortable::new(heartbeat, heartbeat_abort_reg).for_each(move |_| {
+            async move {
                 let host = Arc::clone(&host);
-                async move {
-                    let heartbeat = host.heartbeat().await;
-                    if let Err(e) = host.publish_event("host_heartbeat", heartbeat).await {
-                        error!("failed to publish heartbeat: {e}");
-                    }
+                {
+                    let host = Arc::clone(&host);
+                    Abortable::new(heartbeat, heartbeat_abort_reg)
+                        .for_each(move |_| {
+                            let host = Arc::clone(&host);
+                            async move {
+                                let heartbeat = host.heartbeat().await;
+                                if let Err(e) =
+                                    host.publish_event("host_heartbeat", heartbeat).await
+                                {
+                                    error!("failed to publish heartbeat: {e}");
+                                }
+                            }
+                        })
+                        .await;
                 }
-            })
+                let deadline = { *host.stop_rx.borrow() };
+                host.stop_tx.send_replace(deadline);
+                info!("heartbeat task stopped");
+            }
         });
 
         host.publish_event("host_started", start_evt)
@@ -1975,18 +2002,13 @@ impl Host {
             .context("failed to publish stop event")?;
             // Before we exit, make sure to flush all messages or we may lose some that we've
             // thought were sent (like the host_stopped event)
-            host.ctl_nats
-                .flush()
-                .await
-                .context("failed to flush ctl client")?;
-            host.rpc_nats
-                .flush()
-                .await
-                .context("failed to flush rpc client")?;
-            host.prov_rpc_nats
-                .flush()
-                .await
-                .context("failed to flush prov rpc client")
+            try_join!(
+                host.ctl_nats.flush(),
+                host.rpc_nats.flush(),
+                host.prov_rpc_nats.flush(),
+            )
+            .context("failed to flush NATS clients")?;
+            Ok(())
         }))
     }
 
@@ -2429,6 +2451,7 @@ impl Host {
         self.heartbeat.abort();
         self.data_watch.abort();
         self.queue.abort();
+        self.policy_manager.policy_changes.abort();
         let deadline =
             timeout.and_then(|timeout| Instant::now().checked_add(Duration::from_millis(timeout)));
         self.stop_tx.send_replace(deadline);
