@@ -1672,6 +1672,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpp_demangle"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96e58d342ad113c2b878f16d5d034c03be492ae460cdbc02b7f0f2284d310c7d"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8967,6 +8976,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "clap",
  "futures",
  "http 1.1.0",
  "once_cell",
@@ -8983,6 +8993,7 @@ dependencies = [
  "wasmcloud-core 0.15.0",
  "wasmparser 0.220.0",
  "wasmtime",
+ "wasmtime-cli-flags",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wit-bindgen-wrpc",
@@ -9241,6 +9252,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-cli-flags"
+version = "26.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57ed2fbd2ed77d1b37afa1fc59f432a59d4a78e57d424975cda4f895533fe121"
+dependencies = [
+ "anyhow",
+ "clap",
+ "humantime",
+ "rayon",
+ "wasmtime",
+]
+
+[[package]]
 name = "wasmtime-component-macro"
 version = "26.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9293,6 +9317,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8613075e89e94a48c05862243c2b718eef1b9c337f51493ebf951e149a10fa19"
 dependencies = [
  "anyhow",
+ "cpp_demangle",
  "cranelift-bitset",
  "cranelift-entity",
  "gimli",
@@ -9300,6 +9325,7 @@ dependencies = [
  "log",
  "object",
  "postcard",
+ "rustc-demangle",
  "semver",
  "serde",
  "serde_derive",
