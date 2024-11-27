@@ -1,12 +1,13 @@
 use crate::ComponentConfig;
 
-use core::fmt;
 use core::fmt::Debug;
 use core::time::Duration;
+use core::{fmt, iter};
 
 use std::thread;
 
-use anyhow::Context;
+use anyhow::Context as _;
+use clap::Parser as _;
 use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
 
 /// Default max linear memory for a component (256 MiB)
@@ -15,6 +16,24 @@ pub const MAX_LINEAR_MEMORY: u64 = 256 * 1024 * 1024;
 pub const MAX_COMPONENT_SIZE: u64 = 50 * 1024 * 1024;
 /// Default max number of components
 pub const MAX_COMPONENTS: u32 = 10_000;
+
+// https://github.com/bytecodealliance/wasmtime/blob/b943666650696f1eb7ff8b217762b58d5ef5779d/src/commands/serve.rs#L641-L656
+fn use_pooling_allocator_by_default() -> anyhow::Result<Option<bool>> {
+    const BITS_TO_TEST: u32 = 42;
+    let mut config = wasmtime::Config::new();
+    config.wasm_memory64(true);
+    config.static_memory_maximum_size(1 << BITS_TO_TEST);
+    let engine = wasmtime::Engine::new(&config)?;
+    let mut store = wasmtime::Store::new(&engine, ());
+    // NB: the maximum size is in wasm pages to take out the 16-bits of wasm
+    // page size here from the maximum size.
+    let ty = wasmtime::MemoryType::new64(0, Some(1 << (BITS_TO_TEST - 16)));
+    if wasmtime::Memory::new(&mut store, ty).is_ok() {
+        Ok(Some(true))
+    } else {
+        Ok(None)
+    }
+}
 
 /// [`RuntimeBuilder`] used to configure and build a [Runtime]
 #[derive(Clone, Default)]
@@ -32,7 +51,12 @@ impl RuntimeBuilder {
     /// Returns a new [`RuntimeBuilder`]
     #[must_use]
     pub fn new() -> Self {
-        let mut engine_config = wasmtime::Config::default();
+        let mut opts =
+            wasmtime_cli_flags::CommonOptions::try_parse_from(iter::empty::<&'static str>())
+                .expect("failed to construct common Wasmtime options");
+        let mut engine_config = opts
+            .config(None, use_pooling_allocator_by_default().unwrap_or(None))
+            .expect("failed to construct Wasmtime config");
         engine_config.async_support(true);
         engine_config.epoch_interruption(true);
         engine_config.memory_init_cow(false);

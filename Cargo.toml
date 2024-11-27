@@ -361,6 +361,7 @@ wasmcloud-test-util = { version = "^0.15.0", path = "./crates/test-util", defaul
 wasmcloud-tracing = { version = "^0.11.0", path = "./crates/tracing", default-features = false }
 wasmparser = { version = "0.220", default-features = false }
 wasmtime = { version = "26", default-features = false }
+wasmtime-cli-flags = { version = "26", default-features = false }
 wasmtime-wasi = { version = "26", default-features = false }
 wasmtime-wasi-http = { version = "26", default-features = false }
 wasmtime-wit-bindgen = { version = "26", default-features = false }

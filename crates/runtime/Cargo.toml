@@ -20,6 +20,7 @@ log = ["tracing/log"]
 anyhow = { workspace = true, features = ["std"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+clap = { workspace = true }
 futures = { workspace = true, features = ["async-await", "std"] }
 http = { workspace = true }
 secrecy = { workspace = true }
@@ -37,9 +38,24 @@ wasmtime = { workspace = true, features = [
     "component-model",
     "coredump",
     "cranelift",
+    "demangle",
     "gc",
     "parallel-compilation",
     "pooling-allocator",
+    "runtime",
+    "threads",
+] }
+wasmtime-cli-flags = { workspace = true, features = [
+    "async",
+    "cache",
+    "component-model",
+    "coredump",
+    "cranelift",
+    "gc",
+    "memory-protection-keys",
+    "parallel-compilation",
+    "pooling-allocator",
+    "threads",
 ] }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
