@@ -58,8 +58,6 @@ impl RuntimeBuilder {
             .config(None, use_pooling_allocator_by_default().unwrap_or(None))
             .expect("failed to construct Wasmtime config");
         engine_config.async_support(true);
-        engine_config.epoch_interruption(true);
-        engine_config.memory_init_cow(false);
         engine_config.wasm_component_model(true);
 
         Self {
@@ -137,76 +135,16 @@ impl RuntimeBuilder {
     ///
     /// Fails if the configuration is not valid
     #[allow(clippy::type_complexity)]
-    pub fn build(mut self) -> anyhow::Result<(Runtime, thread::JoinHandle<Result<(), ()>>)> {
-        let mut pooling_config = PoolingAllocationConfig::default();
-
-        // Right now we assume tables_per_component is the same as memories_per_component just like
-        // the default settings (which has a 1:1 relationship between total memories and total
-        // tables), but we may want to change that later. I would love to figure out a way to
-        // configure all these values via something smarter that can look at total memory available
-        let memories_per_component = 1;
-        let tables_per_component = 1;
-        let max_core_instances_per_component = 30;
-        let table_elements = 15000;
-
-        #[allow(clippy::cast_possible_truncation)]
-        pooling_config
-            .total_component_instances(self.max_components)
-            .total_core_instances(self.max_components)
-            .total_gc_heaps(self.max_components)
-            .total_stacks(self.max_components)
-            .max_component_instance_size(self.max_component_size as usize)
-            .max_core_instances_per_component(max_core_instances_per_component)
-            .max_tables_per_component(20)
-            .table_elements(table_elements)
-            // The number of memories an instance can have effectively limits the number of inner components
-            // a composed component can have (since each inner component has its own memory). We default to 32 for now, and
-            // we'll see how often this limit gets reached.
-            .max_memories_per_component(max_core_instances_per_component * memories_per_component)
-            .total_memories(self.max_components * memories_per_component)
-            .total_tables(self.max_components * tables_per_component)
-            // Restrict the maximum amount of linear memory that can be used by a component,
-            // which influences two things we care about:
-            //
-            // - How large of a component we can load (i.e. all components must be less than this value)
-            // - How much memory a fully loaded host carrying c components will use
-            .max_memory_size(self.max_linear_memory as usize)
-            // These numbers are set to avoid page faults when trying to claim new space on linux
-            .linear_memory_keep_resident(10 * 1024)
-            .table_keep_resident(10 * 1024);
-        self.engine_config
-            .allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
-        let engine = match wasmtime::Engine::new(&self.engine_config)
-            .context("failed to construct engine")
-        {
-            Ok(engine) => engine,
-            Err(e) if self.force_pooling_allocator => {
-                anyhow::bail!("failed to construct engine with pooling allocator: {}", e)
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to construct engine with pooling allocator, falling back to dynamic allocator which may result in slower startup and execution of components.");
-                self.engine_config
-                    .allocation_strategy(InstanceAllocationStrategy::OnDemand);
-                wasmtime::Engine::new(&self.engine_config).context("failed to construct engine")?
-            }
-        };
-        let epoch = {
-            let engine = engine.weak();
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(1));
-                let Some(engine) = engine.upgrade() else {
-                    return Ok(());
-                };
-                engine.increment_epoch();
-            })
-        };
+    pub fn build(self) -> anyhow::Result<(Runtime, thread::JoinHandle<Result<(), ()>>)> {
+        let engine =
+            wasmtime::Engine::new(&self.engine_config).context("failed to construct engine")?;
         Ok((
             Runtime {
                 engine,
                 component_config: self.component_config,
                 max_execution_time: self.max_execution_time,
             },
-            epoch,
+            thread::spawn(|| Ok(())),
         ))
     }
 }
