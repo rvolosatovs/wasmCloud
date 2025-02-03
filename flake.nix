@@ -17,7 +17,7 @@
   ];
 
   inputs.nixify.inputs.nixlib.follows = "nixlib";
-  inputs.nixify.url = "github:rvolosatovs/nixify";
+  inputs.nixify.url = "github:rvolosatovs/nixify/fix/sign-pre-fixup";
   inputs.nixlib.url = "github:nix-community/nixpkgs.lib";
   inputs.wit-deps.inputs.nixify.follows = "nixify";
   inputs.wit-deps.inputs.nixlib.follows = "nixlib";
