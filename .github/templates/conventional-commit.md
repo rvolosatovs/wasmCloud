@@ -1,3 +1,4 @@
+${MYSECRET}
 
 ### :warning: It looks like your commit is not formatted in line with Conventional Commits
 
