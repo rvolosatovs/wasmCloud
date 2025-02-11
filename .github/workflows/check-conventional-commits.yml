@@ -7,7 +7,6 @@ permissions:
 
 jobs:
   lint:
-    if: ${{ github.repository == 'wasmCloud/wasmCloud' }}
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -119,7 +118,6 @@ jobs:
           hide_classify: 'RESOLVED'
 
   label-pr:
-    if: ${{ github.repository == 'wasmCloud/wasmCloud' }}
     needs: lint
     runs-on: ubuntu-latest
     permissions:
